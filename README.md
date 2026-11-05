@@ -16,6 +16,8 @@ different connection.
 
 ## Install
 
+### Windows
+
 ```powershell
 git clone https://github.com/Tazmyan/OpenCode-Unlimited.git
 cd OpenCode-Unlimited
@@ -23,6 +25,19 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
 Done. Open a new terminal window so the `opencode-unlimited` command is found.
+
+### Linux / macOS
+
+```bash
+git clone https://github.com/Tazmyan/OpenCode-Unlimited.git
+cd OpenCode-Unlimited
+chmod +x install.sh bin/opencode-unlimited
+./install.sh
+```
+
+The installer copies the plugin to `~/.config/opencode/plugins`, adds `bin` to your `PATH` in `~/.bashrc` (or `~/.zshrc`), and runs the PowerShell install step if `pwsh` is available.
+
+Open a new terminal (or `source ~/.bashrc`) so the `opencode-unlimited` command is found.
 
 Nothing needs admin rights, and your OpenCode settings are not modified.
 

@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  check:
+  check-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -51,3 +51,23 @@ jobs:
         shell: pwsh
         run: |
           powershell -NoProfile -ExecutionPolicy Bypass -File bin/opencode-unlimited.ps1 help
+
+  check-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: node syntax
+        run: |
+          node --check plugins/unlimited-shield.js
+          node --check lib/proxy-bridge.js
+
+      - name: bash syntax
+        run: |
+          bash -n install.sh
+          bash -n bin/opencode-unlimited
+
+      - name: cli responds
+        run: |
+          chmod +x bin/opencode-unlimited
+          bin/opencode-unlimited help
