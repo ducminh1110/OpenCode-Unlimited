@@ -3,6 +3,8 @@ set -euo pipefail
 
 # opencode-unlimited install for Linux
 # Mirrors install.ps1 but targets XDG paths and shell rc files.
+# Supports re-install: if already installed, it backs up existing state
+# and identity, replaces the plugin/config, then restores them.
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bin="$root/bin"
@@ -14,6 +16,18 @@ bridge="$root/lib/proxy-bridge.js"
 ok()   { printf '  [+] %s\n' "$1"; }
 bad()  { printf '  [x] %s\n' "$1" >&2; exit 1; }
 info() { printf '      %s\n' "$1"; }
+
+# XDG config dir
+if [[ -z "${XDG_CONFIG_HOME:-}" ]]; then
+  config_dir="$HOME/.config/opencode"
+else
+  config_dir="$XDG_CONFIG_HOME/opencode"
+fi
+plugin_dir="$config_dir/plugins"
+plugin_dst="$plugin_dir/unlimited-shield.js"
+state_file="$config_dir/unlimited.json"
+identity_file="$config_dir/identity.json"
+legacy_identity="$HOME/.opencode/identity.json"
 
 printf '==> opencode-unlimited install\n'
 
@@ -28,39 +42,55 @@ else
   info "node not found: proxy bridge and -Db rotation stay unavailable"
 fi
 
-# XDG config dir
-if [[ -z "${XDG_CONFIG_HOME:-}" ]]; then
-  config_dir="$HOME/.config/opencode"
-else
-  config_dir="$XDG_CONFIG_HOME/opencode"
+# Detect an existing installation
+installed=false
+if [[ -e "$plugin_dst" || -e "$state_file" || -e "$identity_file" || -e "$legacy_identity" ]]; then
+  installed=true
 fi
-plugin_dir="$config_dir/plugins"
-plugin_dst="$plugin_dir/unlimited-shield.js"
+
+# Back up state/identity so a re-install preserves them
+backup_dir=""
+if $installed; then
+  backup_dir="$(mktemp -d)"
+  if [[ -e "$state_file" ]]; then cp -f "$state_file" "$backup_dir/"; fi
+  if [[ -e "$identity_file" ]]; then cp -f "$identity_file" "$backup_dir/"; fi
+  if [[ -e "$legacy_identity" ]]; then cp -f "$legacy_identity" "$backup_dir/"; fi
+  ok "existing installation detected; backing up state to $backup_dir"
+fi
 
 mkdir -p "$plugin_dir"
 cp -f "$plugin_src" "$plugin_dst"
 ok "plugin deployed: $plugin_dst"
 
-# PATH
-if [[ -z "${BIN_DIR_ADDED:-}" ]]; then
-  shell_rc=""
-  if [[ -n "${ZSH_VERSION:-}" ]]; then shell_rc="$HOME/.zshrc"; fi
-  if [[ -z "$shell_rc" && -f "$HOME/.bashrc" ]]; then shell_rc="$HOME/.bashrc"; fi
-  if [[ -z "$shell_rc" && -f "$HOME/.profile" ]]; then shell_rc="$HOME/.profile"; fi
-  if [[ -z "$shell_rc" ]]; then shell_rc="$HOME/.bashrc"; fi
-
-  if ! grep -qF "$bin" "$shell_rc" 2>/dev/null; then
-    {
-      printf '\n# opencode-unlimited\n'
-      printf 'export PATH="%s:$PATH"\n' "$bin"
-    } >> "$shell_rc"
-    ok "added to user PATH in $shell_rc: $bin"
-    info "open a new terminal or run: source $shell_rc"
-  else
-    ok "already on PATH in $shell_rc: $bin"
+# Restore state/identity (preserve across re-install)
+if [[ -n "$backup_dir" ]]; then
+  if [[ -e "$backup_dir/unlimited.json" ]]; then cp -f "$backup_dir/unlimited.json" "$state_file"; fi
+  if [[ -e "$backup_dir/identity.json" ]]; then cp -f "$backup_dir/identity.json" "$identity_file"; fi
+  if [[ -e "$backup_dir/identity.json" ]]; then
+    mkdir -p "$(dirname "$legacy_identity")"
+    cp -f "$backup_dir/identity.json" "$legacy_identity"
   fi
-  export PATH="$bin:$PATH"
+  rm -rf "$backup_dir"
 fi
+
+# PATH (never duplicate)
+shell_rc=""
+if [[ -n "${ZSH_VERSION:-}" ]]; then shell_rc="$HOME/.zshrc"; fi
+if [[ -z "$shell_rc" && -f "$HOME/.bashrc" ]]; then shell_rc="$HOME/.bashrc"; fi
+if [[ -z "$shell_rc" && -f "$HOME/.profile" ]]; then shell_rc="$HOME/.profile"; fi
+if [[ -z "$shell_rc" ]]; then shell_rc="$HOME/.bashrc"; fi
+
+if ! grep -qF "$bin" "$shell_rc" 2>/dev/null; then
+  {
+    printf '\n# opencode-unlimited\n'
+    printf 'export PATH="%s:$PATH"\n' "$bin"
+  } >> "$shell_rc"
+  ok "added to user PATH in $shell_rc: $bin"
+  info "open a new terminal or run: source $shell_rc"
+else
+  ok "already on PATH in $shell_rc: $bin"
+fi
+export PATH="$bin:$PATH"
 
 chmod +x "$entry"
 
@@ -77,4 +107,8 @@ info "opencode-unlimited id         rotate the project id"
 info "opencode-unlimited test       probe the bucket on this IP (free)"
 info "opencode-unlimited proxy set socks5://127.0.0.1:1080   optional IP path"
 printf '\n'
-ok "installed"
+if $installed; then
+  ok "updated (existing config and identity preserved)"
+else
+  ok "installed"
+fi
