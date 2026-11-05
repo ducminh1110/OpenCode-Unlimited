@@ -19,7 +19,7 @@ different connection.
 ### Windows
 
 ```powershell
-git clone https://github.com/Tazmyan/OpenCode-Unlimited.git
+git clone https://github.com/ducminh1110/OpenCode-Unlimited.git
 cd OpenCode-Unlimited
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
@@ -29,7 +29,7 @@ Done. Open a new terminal window so the `opencode-unlimited` command is found.
 ### Linux / macOS
 
 ```bash
-git clone https://github.com/Tazmyan/OpenCode-Unlimited.git
+git clone https://github.com/ducminh1110/OpenCode-Unlimited.git
 cd OpenCode-Unlimited
 chmod +x install.sh bin/opencode-unlimited
 ./install.sh
