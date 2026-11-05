@@ -54,7 +54,7 @@ read_text_file() {
 
 # node_json <js> : pipe JSON (stdin) through node, print result to stdout
 node_json() {
-  node -e "$1" 2>/dev/null
+  node -e "$1" "${@:2}" 2>/dev/null
 }
 
 get_json() {
@@ -66,14 +66,22 @@ get_json() {
 }
 
 get_config() {
-  local cfg
-  cfg="$(get_json "$state_file")"
-  if [[ -n "$cfg" ]]; then
-    printf '%s\n' "$cfg"
-  else
+  local saved
+  saved="$(get_json "$state_file")"
+  if [[ -z "$saved" ]]; then
     printf '{"identityPath":"%s","pluginPath":"%s","model":"%s","orgId":"","proxy":"","bridgePort":%d,"ipMode":"manual","rotateDb":false,"lastIp":"","lastBucket":"","updatedAt":""}\n' \
       "$identity_file" "$plugin_file" "$default_model" "$default_bridge_port"
+    return
   fi
+  # merge defaults for missing/empty keys (mirrors the PowerShell installer)
+  printf '%s' "$saved" | node_json '
+const d=JSON.parse(require("fs").readFileSync(0,"utf8"));
+const defs={identityPath:process.argv[1],pluginPath:process.argv[2],model:process.argv[3],orgId:"",proxy:"",bridgePort:Number(process.argv[4]),ipMode:"manual",rotateDb:false,lastIp:"",lastBucket:"",updatedAt:""};
+for (const k of Object.keys(defs)) {
+  if (d[k]===undefined || d[k]===null || d[k]==="") d[k]=defs[k];
+}
+process.stdout.write(JSON.stringify(d));
+' "$identity_file" "$plugin_file" "$default_model" "$default_bridge_port"
 }
 
 save_config() {
