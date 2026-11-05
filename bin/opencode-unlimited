@@ -1,0 +1,959 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# opencode-unlimited — Linux port
+# Mirrors bin/opencode-unlimited.ps1 but targets XDG paths and a bash CLI.
+# Reuses lib/proxy-bridge.js and plugins/unlimited-shield.js (cross-platform Node).
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root="$(cd "$script_dir/.." && pwd)"
+bridge_js="$root/lib/proxy-bridge.js"
+bundled_plugin="$root/plugins/unlimited-shield.js"
+
+if [[ -z "${XDG_CONFIG_HOME:-}" ]]; then config_dir="$HOME/.config/opencode"; else config_dir="$XDG_CONFIG_HOME/opencode"; fi
+if [[ -z "${XDG_DATA_HOME:-}" ]]; then data_dir="$HOME/.local/share/opencode"; else data_dir="$XDG_DATA_HOME/opencode"; fi
+state_file="$config_dir/unlimited.json"
+identity_file="$config_dir/identity.json"
+legacy_identity="$HOME/.opencode/identity.json"
+plugin_dir="$config_dir/plugins"
+plugin_file="$plugin_dir/unlimited-shield.js"
+pid_file="$config_dir/unlimited-bridge.pid"
+log_file="$config_dir/unlimited-bridge.log"
+ip_cache_file="$config_dir/unlimited-ip.json"
+
+gateway="https://opencode.ai/inference/openai/v1/chat/completions"
+trace_url="https://cloudflare.com/cdn-cgi/trace"
+default_model="deepseek-v4.1-flash-free"
+default_bridge_port=8899
+
+command="${1:-help}"
+shift || true
+rest=("$@")
+
+step()   { printf '==> %s\n' "$*"; }
+ok()     { printf '  [+] %s\n' "$*"; }
+warn()   { printf '  [!] %s\n' "$*"; }
+bad()    { printf '  [x] %s\n' "$*" >&2; }
+info()   { printf '      %s\n' "$*"; }
+
+new_hex() {
+  node -e "console.log(require('crypto').randomBytes(Number(process.argv[1])).toString('hex'))" "$1"
+}
+
+write_text_file() {
+  local path="$1" text="$2"
+  local dir; dir="$(dirname "$path")"
+  mkdir -p "$dir"
+  printf '%s' "$text" > "$path"
+}
+
+read_text_file() {
+  local path="$1"
+  [[ -f "$path" ]] && cat "$path"
+}
+
+# node_json <js> : pipe JSON (stdin) through node, print result to stdout
+node_json() {
+  node -e "$1" 2>/dev/null
+}
+
+get_json() {
+  local path="$1" raw
+  raw="$(read_text_file "$path")" || return 0
+  [[ -n "$raw" ]] || return 0
+  raw="${raw#$'\xEF\xBB\xBF'}"
+  node_json 'const d=JSON.parse(require("fs").readFileSync(0,"utf8").replace(/^\uFEFF/,"")); process.stdout.write(JSON.stringify(d))' <<<"$raw" || return 0
+}
+
+get_config() {
+  local cfg
+  cfg="$(get_json "$state_file")"
+  if [[ -n "$cfg" ]]; then
+    printf '%s\n' "$cfg"
+  else
+    printf '{"identityPath":"%s","pluginPath":"%s","model":"%s","orgId":"","proxy":"","bridgePort":%d,"ipMode":"manual","rotateDb":false,"lastIp":"","lastBucket":"","updatedAt":""}\n' \
+      "$identity_file" "$plugin_file" "$default_model" "$default_bridge_port"
+  fi
+}
+
+save_config() {
+  local cfg="$1"
+  cfg="$(node_json 'const d=JSON.parse(require("fs").readFileSync(0,"utf8")); d.updatedAt=new Date().toISOString(); process.stdout.write(JSON.stringify(d))' <<<"$cfg")"
+  write_text_file "$state_file" "$cfg"
+}
+
+config_get() {
+  local key="$1" cfg="$2"
+  printf '%s' "$cfg" | node_json 'const d=JSON.parse(require("fs").readFileSync(0,"utf8")); process.stdout.write(String(d[process.argv[1]]||""))' "$key"
+}
+
+config_set() {
+  local key="$1" val="$2" cfg="$3"
+  cfg="$(printf '%s' "$cfg" | node_json 'const d=JSON.parse(require("fs").readFileSync(0,"utf8")); d[process.argv[1]]=process.argv[2]; process.stdout.write(JSON.stringify(d))' "$key" "$val")"
+  printf '%s' "$cfg"
+}
+
+resolve_opencode() {
+  if command -v opencode >/dev/null 2>&1; then command -v opencode; return; fi
+  local candidates=(
+    "$HOME/.npm-global/bin/opencode"
+    "$HOME/.local/share/npm/bin/opencode"
+    "$HOME/.local/bin/opencode"
+    "$HOME/.bun/bin/opencode"
+    "$HOME/scoop/shims/opencode"
+    "/usr/local/bin/opencode"
+    "/usr/bin/opencode"
+  )
+  local p
+  for p in "${candidates[@]}"; do [[ -x "$p" ]] && { printf '%s' "$p"; return; }; done
+  printf 'opencode'
+}
+
+get_curl() {
+  command -v curl >/dev/null 2>&1 && printf 'curl' || printf ''
+}
+
+invoke_curl() {
+  local curl_cmd; curl_cmd="$(get_curl)"
+  [[ -n "$curl_cmd" ]] || return 0
+  "$curl_cmd" -s "$@" 2>/dev/null || true
+}
+
+invoke_webrequest_raw() {
+  local method="$1" url="$2" body="$3" proxy_url="$4"
+  local tmp body_file
+  tmp="$(mktemp)"
+  if [[ -n "$body" ]]; then printf '%s' "$body" > "$tmp"; fi
+  local args=(-s -o "$tmp" -w "\n%{http_code}" --max-time 20)
+  if [[ -n "$proxy_url" && "$proxy_url" =~ ^(https?|socks5h?):// ]]; then args+=(--proxy "$proxy_url"); fi
+  args+=(-X "$method" -H "Content-Type: application/json" -H "User-Agent: opencode/2.1.4")
+  if [[ -n "$body" ]]; then args+=(-H "$(printf 'Content-Length: %s' "$(wc -c < "$tmp")")" --data-binary @"$tmp"); fi
+  args+=("$url")
+  local out; out="$(invoke_curl "${args[@]}")" || true
+  local status=0 resp_body=""
+  if [[ -n "$out" ]]; then
+    resp_body="${out%$'\n'*}"
+    status="${out##*$'\n'}"
+    [[ "$resp_body" == "$out" ]] && resp_body=""
+  fi
+  rm -f "$tmp"
+  printf '{"Status":%s,"Body":%s}\n' "$status" "$(printf '%s' "$resp_body" | node_json 'const s=require("fs").readFileSync(0,"utf8"); process.stdout.write(JSON.stringify(s))')"
+}
+
+get_egress_ip() {
+  local proxy_url="$1" force="${2:-false}"
+  local cache ip="unavailable" at via=""
+  cache="$(get_json "$ip_cache_file")"
+  if [[ "$force" != "true" && -n "$cache" ]]; then
+    ip="$(config_get ip "$cache")"
+    at="$(config_get at "$cache")"
+    via="$(config_get via "$cache")"
+    local now age=0
+    now="$(date +%s)"
+    age=$(( now - at ))
+    if [[ -n "$ip" && "$ip" != "unavailable" && $age -ge 0 && $age -lt 60 && "$via" == "$proxy_url" ]]; then
+      printf '%s' "$ip"; return
+    fi
+  fi
+  local curl_cmd; curl_cmd="$(get_curl)"
+  if [[ -n "$curl_cmd" ]]; then
+    local curl_args=(-s --max-time 8)
+    [[ -n "$proxy_url" ]] && curl_args+=(--proxy "$proxy_url")
+    curl_args+=("$trace_url")
+    local out; out="$(invoke_curl "${curl_args[@]}")" || true
+    if [[ -n "$out" ]]; then
+      while IFS= read -r line; do
+        if [[ "$line" =~ ^ip=(.+)$ ]]; then ip="${BASH_REMATCH[1]}"; ip="${ip// /}"; fi
+      done <<< "$out"
+    fi
+  fi
+  if [[ "$ip" == "unavailable" ]]; then
+    local result; result="$(invoke_webrequest_raw "GET" "$trace_url" "" "$proxy_url")" || true
+    local status body
+    status="$(config_get Status "$result")"
+    body="$(config_get Body "$result")"
+    if [[ "$status" == "200" ]]; then
+      while IFS= read -r line; do
+        if [[ "$line" =~ ^ip=(.+)$ ]]; then ip="${BASH_REMATCH[1]}"; ip="${ip// /}"; fi
+      done <<< "$body"
+    fi
+  fi
+  if [[ "$ip" != "unavailable" ]]; then
+    local now; now="$(date +%s)"
+    local entry; entry="$(printf '{"ip":"%s","at":%s,"via":%s}\n' "$ip" "$now" "$(printf '%s' "$proxy_url" | node_json 'process.stdout.write(JSON.stringify(require("fs").readFileSync(0,"utf8")))')")"
+    write_text_file "$ip_cache_file" "$entry"
+  fi
+  printf '%s' "$ip"
+}
+
+get_org_id() {
+  local cfg="$1"
+  local orgId; orgId="$(config_get orgId "$cfg")"
+  if [[ -n "$orgId" ]]; then printf '%s' "$orgId"; return; fi
+  local oc raw json
+  oc="$(resolve_opencode)"
+  raw="$("$oc" api get /api/provider 2>/dev/null | tr -d '\r')" || true
+  if [[ -n "$raw" ]]; then
+    orgId="$(printf '%s' "$raw" | node_json '
+const d=JSON.parse(require("fs").readFileSync(0,"utf8"));
+const data=d.data||[];
+for (const p of data) {
+  if (p.id==="opencode") {
+    const h=p.headers||{};
+    const org=h["x-opencode-org-id"]||"";
+    if (org) { process.stdout.write(org); break; }
+  }
+}
+')"
+    if [[ -n "$orgId" ]]; then
+      local new_cfg; new_cfg="$(config_set orgId "$orgId" "$cfg")"; save_config "$new_cfg" >/dev/null
+      printf '%s' "$orgId"; return
+    fi
+  fi
+  printf ''
+}
+
+new_probe_result() {
+  local code="$1" body="$2"
+  local state="unknown"
+  if [[ "$code" -eq 429 && "$body" == *"FreeUsageLimitError"* ]]; then state="exhausted"
+  elif [[ "$code" -eq 400 && "$body" == *"x-opencode-org-id"* ]]; then state="unknown"
+  elif [[ "$code" -gt 0 ]]; then state="fresh"
+  else state="error"; fi
+  printf '{"State":"%s","Status":%s,"Body":%s}\n' "$state" "$code" "$(printf '%s' "$body" | node_json 'process.stdout.write(JSON.stringify(require("fs").readFileSync(0,"utf8")))')"
+}
+
+invoke_quota_probe() {
+  local cfg="$1"
+  local org; org="$(get_org_id "$cfg")"
+  if [[ -z "$org" ]]; then
+    printf '{"State":"unknown","Status":0,"Body":"org id not discovered yet"}\n'; return
+  fi
+  local model; model="$(config_get model "$cfg")"
+  model="${model##*/}"
+  local payload; payload="$(printf '{"model":"%s","messages":[{"role":"user","content":"1"}],"max_tokens":1,"stream":false}\n' "$model")"
+  local curl_cmd; curl_cmd="$(get_curl)"
+  if [[ -n "$curl_cmd" ]]; then
+    local tmp; tmp="$(mktemp)"
+    printf '%s' "$payload" > "$tmp"
+    local raw; raw="$(invoke_curl -s -o - -w '\n%{http_code}' --max-time 20 -X POST "$gateway" \
+      -H "Content-Type: application/json" -H "User-Agent: opencode/2.1.4" \
+      -H "x-opencode-client: cli" -H "x-opencode-project: $(new_hex 20)" \
+      -H "x-opencode-org-id: $org" --data-binary @"$tmp")" || true
+    rm -f "$tmp"
+    if [[ -n "$raw" ]]; then
+      local body="${raw%$'\n'*}"
+      local code="${raw##*$'\n'}"
+      [[ "$body" == "$raw" ]] && body=""
+      new_probe_result "$code" "$body"; return
+    fi
+  fi
+  local headers="x-opencode-org-id: $org"
+  local fallback; fallback="$(invoke_webrequest_raw "POST" "$gateway" "$payload" "")" || true
+  local status body
+  status="$(config_get Status "$fallback")"
+  body="$(config_get Body "$fallback")"
+  new_probe_result "$status" "$body"
+}
+
+get_bucket_label() {
+  local state="$1"
+  case "$state" in
+    fresh)     printf 'RAW OK - the direct API accepted this request';;
+    exhausted) printf 'RAW 429 - direct API refused; this does not measure the app quota';;
+    unknown)   printf 'UNKNOWN - could not read the gate';;
+    *)         printf 'ERROR - probe failed';;
+  esac
+}
+
+new_identity() {
+  local id; id="$(new_hex 20)"
+  local drive="${SystemDrive:-/}"
+  local dir; dir="$drive/dev/workspace-$(new_hex 4)"
+  local json; json="$(printf '{"projectId":"%s","clientId":"cli","directory":"%s","createdAt":"%s"}\n' \
+    "$id" "$dir" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
+  write_text_file "$identity_file" "$json"
+  if [[ -d "$(dirname "$legacy_identity")" ]]; then write_text_file "$legacy_identity" "$json"; fi
+  printf '%s' "$json"
+}
+
+get_identity() {
+  local path parsed projectId
+  for path in "$identity_file" "$legacy_identity"; do
+    parsed="$(get_json "$path")" || continue
+    projectId="$(config_get projectId "$parsed")"
+    if [[ -n "$projectId" ]]; then printf '%s' "$parsed"; return; fi
+  done
+  printf ''
+}
+
+test_node_sqlite() {
+  if ! command -v node >/dev/null 2>&1; then return 1; fi
+  local version parts major minor
+  version="$(node --version 2>/dev/null | tr -d 'v')" || return 1
+  IFS='.' read -r major minor _ <<< "$version"
+  major="${major:-0}"; minor="${minor:-0}"
+  (( major > 22 )) && return 0
+  [[ $major -eq 22 && $minor -ge 25 ]] && return 0
+  return 1
+}
+
+get_database_path() {
+  local db="$data_dir/opencode.db"
+  [[ -f "$db" ]] && printf '%s' "$db"
+}
+
+invoke_node_script() {
+  local source="$1"; shift
+  if ! command -v node >/dev/null 2>&1; then return; fi
+  local tmp; tmp="$(mktemp)"
+  printf '%s' "$source" > "$tmp"
+  local warn="${NODE_NO_WARNINGS:-}"
+  export NODE_NO_WARNINGS=1
+  local out
+  out="$(node "$tmp" "$@" 2>&1)" || true
+  if [[ -z "${warn:-}" ]]; then unset NODE_NO_WARNINGS; else export NODE_NO_WARNINGS="$warn"; fi
+  rm -f "$tmp"
+  printf '%s' "$out"
+}
+
+convert_to_db_path() {
+  local path="$1" full
+  full="$(readlink -f "$path" 2>/dev/null || printf '%s' "$path")"
+  printf '%s' "${full//\\//}" | tr '[:upper:]' '[:lower:]' | sed 's:/*$::'
+}
+
+update_project_ids() {
+  local directory="$1"
+  local db; db="$(get_database_path)"
+  if [[ -z "$db" ]]; then warn "opencode.db not found at $data_dir"; return; fi
+  if ! test_node_sqlite; then warn "node 22.5+ required for -Db rotation, skipped"; return; fi
+  local source
+  source=$(cat <<'NODE'
+const { DatabaseSync } = require("node:sqlite");
+const { randomBytes } = require("node:crypto");
+const db = new DatabaseSync(process.argv[2]);
+const want = (process.argv[3] || "").trim().toLowerCase();
+if (want) {
+  const hit = db.prepare("select project_id, directory from project_directory where lower(replace(directory, char(92), '/')) = lower(replace(?, char(92), '/')) or lower(replace(directory, char(92), '/')) like lower(replace(?, char(92), '/')) || '/%'").all(want, want);
+  const ids = [...new Set(hit.map((r) => r.project_id))];
+  if (ids.length !== 1) {
+    if (ids.length === 0) {
+      const known = db.prepare("select directory from project_directory order by directory").all();
+      console.log("no project matches: " + want);
+      for (const row of known) console.log("  " + row.directory);
+      process.exit(3);
+    }
+    console.log("ambiguous, " + ids.length + " projects match: " + want);
+    process.exit(4);
+  }
+  process.argv[3] = ids[0];
+}
+const tables = db.prepare("select name from sqlite_master where type='table'").all();
+const carriers = [];
+for (const table of tables) {
+  const columns = db.prepare("pragma table_info(" + table.name + ")").all().map((c) => c.name);
+  if (columns.includes("project_id")) carriers.push(table.name);
+}
+const only = want ? process.argv[3] : null;
+const projects = only
+  ? db.prepare("select id from project where id = ?").all(only)
+  : db.prepare("select id from project where id != 'global'").all();
+if (!projects.length) { console.log("project row missing for " + only); process.exit(5); }
+db.exec("begin");
+db.exec("pragma defer_foreign_keys = ON");
+let renamed = 0, touched = 0;
+for (const project of projects) {
+  const next = randomBytes(20).toString("hex");
+  db.prepare("update project set id = ? where id = ?").run(next, project.id);
+  for (const table of carriers) {
+    const key = table === "project" ? "id" : "project_id";
+    const info = db.prepare("update " + table + " set " + key + " = ? where " + key + " = ?").run(next, project.id);
+    touched += Number(info.changes || 0);
+  }
+  renamed += 1;
+}
+db.exec("commit");
+console.log("projects rotated: " + renamed + ", rows updated: " + touched);
+NODE
+)
+  local target_arg=""
+  if [[ -n "$directory" ]]; then target_arg="$(convert_to_db_path "$directory")"; fi
+  local out; out="$(invoke_node_script "$source" "$db" "$target_arg")" || true
+  local ok=true
+  if [[ -n "$out" ]]; then
+    local line; line="$(printf '%s' "$out" | tr '\n' ' ' | sed 's/^ *//;s/ *$//')"
+    if [[ "$line" == *"no project matches"* || "$line" == *"ambiguous"* || "$line" == *"project row missing"* ]]; then bad "$line"; ok=false; else ok "$line"; fi
+  fi
+  $ok
+}
+
+remove_stuck_errors() {
+  local db; db="$(get_database_path)"
+  [[ -z "$db" ]] && return
+  test_node_sqlite || return
+  local source
+  source=$(cat <<'NODE'
+const { DatabaseSync } = require("node:sqlite");
+const db = new DatabaseSync(process.argv[2]);
+let removed = 0;
+const tables = db.prepare("select name from sqlite_master where type='table'").all();
+for (const table of tables) {
+  const columns = db.prepare("pragma table_info(" + table.name + ")").all().map((c) => c.name);
+  const text = columns.filter((c) => c !== "id" && c !== "session_id");
+  if (!text.length) continue;
+  const where = text.map((c) => c + " like '%FreeUsageLimitError%'").join(" or ");
+  try { const info = db.prepare("delete from " + table.name + " where " + where).run(); removed += Number(info.changes || 0); } catch {}
+}
+console.log("stuck limit rows removed: " + removed);
+NODE
+)
+  local out; out="$(invoke_node_script "$source" "$db")" || true
+  [[ -n "$out" ]] && info "$(printf '%s' "$out" | tr '\n' ' ')"
+}
+
+install_slash_command() {
+  local cmd_root="$config_dir/commands"
+  rm -f "$cmd_root/opencode-unlimited.md" 2>/dev/null || true
+  rm -rf "$cmd_root/opencode-unlimited" 2>/dev/null || true
+  local cli="$script_dir/opencode-unlimited.ps1"
+  local tail=$'\n\nAnswer with one short line about what the output above reported. No more.'
+  local cfg_path
+  if [[ -f "$config_dir/opencode.jsonc" ]]; then cfg_path="$config_dir/opencode.jsonc"; elif [[ -f "$config_dir/opencode.json" ]]; then cfg_path="$config_dir/opencode.json"; else cfg_path=""; fi
+  # ensure commands object (handled in the heredoc below)
+  local cfg_path
+  if [[ -f "$config_dir/opencode.jsonc" ]]; then cfg_path="$config_dir/opencode.jsonc"; elif [[ -f "$config_dir/opencode.json" ]]; then cfg_path="$config_dir/opencode.json"; else cfg_path=""; fi
+  node - "$cfg_path" "$cli" "$tail" <<'NODE'
+const fs=require("fs");
+const [cfgPath,cli,tail]=process.argv.slice(2);
+let cfg={};
+if (cfgPath && fs.existsSync(cfgPath)) {
+  try { cfg=JSON.parse(fs.readFileSync(cfgPath,"utf8").replace(/^\uFEFF/,"")); } catch { cfg={}; }
+}
+const cmds=cfg.commands||{};
+const defs={
+ "opencode-unlimited":{Args:"status",Desc:"OpenCode free-tier helper - project id, egress ip, bucket"},
+ "opencode-unlimited:test":{Args:"test",Desc:"check the free bucket on this IP (free)"},
+ "opencode-unlimited:reset":{Args:"reset",Desc:"rotate a project (path optional), clear stuck limit errors"},
+ "opencode-unlimited:id":{Args:"id",Desc:"rotate a project id, pass a folder to pick which"},
+};
+const argNames=new Set(["opencode-unlimited:reset","opencode-unlimited:id"]);
+for (const [name,def] of Object.entries(defs)) {
+  let argText=def.Args;
+  if (argNames.has(name)) argText=argText+' "$ARGUMENTS"';
+  const tmpl='!`powershell -NoProfile -ExecutionPolicy Bypass -File "'+cli+'" '+argText+'`'+tail;
+  cmds[name]={description:def.Desc,template:tmpl};
+}
+cfg.commands=cmds;
+if (cfgPath) fs.writeFileSync(cfgPath,JSON.stringify(cfg,null,2));
+process.stdout.write("slash commands: "+Object.keys(defs).join(", ")+"\n");
+NODE
+  ok "slash commands installed"
+}
+
+install_plugin() {
+  [[ -e "$bundled_plugin" ]] || { bad "bundled plugin missing: $bundled_plugin"; return; }
+  mkdir -p "$plugin_dir"
+  cp -f "$bundled_plugin" "$plugin_file"
+  ok "plugin deployed: $plugin_file"
+}
+
+get_plugin_state() {
+  if [[ -f "$plugin_file" ]]; then printf 'enabled'; elif [[ -f "$plugin_file.disabled" ]]; then printf 'disabled'; else printf 'missing'; fi
+}
+
+set_plugin_enabled() {
+  local enabled="$1"
+  local disabled="$plugin_file.disabled"
+  if [[ "$enabled" == "true" ]]; then
+    [[ -f "$disabled" ]] && mv -f "$disabled" "$plugin_file"
+    return
+  fi
+  [[ -f "$plugin_file" ]] && mv -f "$plugin_file" "$disabled"
+}
+
+set_service_env() {
+  local name="$1" value="$2"
+  local oc; oc="$(resolve_opencode)"
+  if [[ -z "$value" ]]; then "$oc" service unset env "$name" >/dev/null 2>&1 || true
+  else "$oc" service set env "$name" "$value" >/dev/null 2>&1 || true; fi
+}
+
+restart_service() {
+  local oc; oc="$(resolve_opencode)"
+  info "restarting background service"
+  "$oc" service restart >/dev/null 2>&1 || warn "service restart failed"
+}
+
+get_bridge_pid() {
+  local raw; raw="$(read_text_file "$pid_file")" || true
+  [[ "$raw" =~ ^[0-9]+$ ]] && printf '%s' "${raw// /}" || printf '0'
+}
+
+start_bridge() {
+  local cfg="$1"
+  local bridge_port; bridge_port="$(config_get bridgePort "$cfg")"
+  local bridge_pid; bridge_pid="$(get_bridge_pid)"
+  if [[ "$bridge_pid" -gt 0 ]] && kill -0 "$bridge_pid" 2>/dev/null; then
+    info "bridge already running (pid $bridge_pid)"; return 0
+  fi
+  command -v node >/dev/null 2>&1 || { bad "node not found on PATH, bridge cannot start"; return 1; }
+  [[ -e "$bridge_js" ]] || { bad "bridge script missing: $bridge_js"; return 1; }
+  local proxy; proxy="$(config_get proxy "$cfg")"
+  node "$bridge_js" --listen "127.0.0.1:$bridge_port" --upstream "$proxy" --log "$log_file" &
+  local proc_id=$!
+  printf '%s' "$proc_id" > "$pid_file"
+  sleep 0.8
+  if kill -0 "$proc_id" 2>/dev/null; then
+    ok "bridge up on 127.0.0.1:$bridge_port -> $proxy"; return 0
+  fi
+  bad "bridge exited, see $log_file"; return 1
+}
+
+stop_bridge() {
+  local bridge_pid; bridge_pid="$(get_bridge_pid)"
+  if [[ "$bridge_pid" -gt 0 ]]; then
+    local proc; proc="$(kill -0 "$bridge_pid" 2>/dev/null && printf '%s' "$bridge_pid")"
+    if [[ -n "$proc" ]]; then kill -force "$bridge_pid" 2>/dev/null || true; ok "bridge stopped"; fi
+  fi
+  rm -f "$pid_file"
+}
+
+test_upstream() {
+  local proxy_url="$1"
+  local curl_cmd; curl_cmd="$(get_curl)"
+  [[ -n "$curl_cmd" ]] || return 0
+  local out; out="$(invoke_curl -s --max-time 10 --proxy "$proxy_url" "$trace_url")" || true
+  [[ "$out" == *"ip="* ]] && return 0 || return 1
+}
+
+apply_proxy() {
+  local cfg="$1"
+  local proxy; proxy="$(config_get proxy "$cfg")"
+  if [[ -z "$proxy" ]]; then
+    set_service_env HTTPS_PROXY ""; set_service_env HTTP_PROXY ""; set_service_env ALL_PROXY ""
+    set_service_env NO_PROXY "localhost,127.0.0.1"
+    ok "service proxy cleared, direct egress"; return 0
+  fi
+  local url="$proxy" via_bridge=false
+  if [[ "$url" =~ ^socks5h?:// ]]; then
+    if ! start_bridge "$cfg"; then return 1; fi
+    url="http://127.0.0.1:$default_bridge_port"; via_bridge=true
+  fi
+  if ! test_upstream "$url"; then
+    bad "upstream not answering: $proxy"; info "opencode was not switched, fix the proxy and retry"
+    $via_bridge && stop_bridge
+    return 1
+  fi
+  ok "upstream reachable"
+  set_service_env HTTPS_PROXY "$url"; set_service_env HTTP_PROXY "$url"; set_service_env ALL_PROXY "$url"
+  set_service_env NO_PROXY "localhost,127.0.0.1"
+  ok "service proxy set: $url"; return 0
+}
+
+get_warp_cli() {
+  command -v warp-cli >/dev/null 2>&1 && printf 'warp-cli' || {
+    local p
+    for p in "/usr/bin/warp-cli" "/usr/local/bin/warp-cli"; do [[ -x "$p" ]] && { printf '%s' "$p"; return; }; done
+    printf ''
+  }
+}
+
+cmd_install() {
+  step "installing opencode-unlimited"
+  install_plugin
+  install_slash_command
+  local cfg; cfg="$(get_config)"
+  local org; org="$(get_org_id "$cfg")"
+  if [[ -n "$org" ]]; then ok "org id discovered: $org"; else warn "org id not discovered yet, run opencode once and retry"; fi
+  save_config "$cfg" >/dev/null
+  local bin_dir; bin_dir="$script_dir"
+  local user_path
+  user_path="$(grep -o 'export PATH=.*' "$HOME/.bashrc" 2>/dev/null | head -1 || true)"
+  if [[ -z "${user_path:-}" ]] || [[ "$user_path" != *"$bin_dir"* ]]; then
+    {
+      printf '\n# opencode-unlimited\n'
+      printf 'export PATH="%s:$PATH"\n' "$bin_dir"
+    } >> "$HOME/.bashrc"
+    ok "added to user PATH: $bin_dir"
+    info "open a new terminal to pick it up"
+  else
+    ok "already on PATH: $bin_dir"
+  fi
+  export PATH="$bin_dir:$PATH"
+  local id; id="$(get_identity)"
+  if [[ -z "$id" ]]; then new_identity >/dev/null; fi
+  printf '\n'
+  ok "done. try: opencode-unlimited status"
+}
+
+get_path_arg() {
+  local item
+  for item in "${rest[@]}"; do
+    [[ -z "$item" ]] && continue
+    [[ "$item" == "-Db" || "$item" == "--db" ]] && continue
+    [[ "$item" == -* ]] && continue
+    printf '%s' "$item"; return
+  done
+  printf ''
+}
+
+get_db_flag() {
+  local item
+  for item in "${rest[@]}"; do [[ "$item" == "-Db" || "$item" == "--db" ]] && return 0; done
+  return 1
+}
+
+cmd_id() {
+  step "rotating project identity"
+  local cfg; cfg="$(get_config)"
+  local target; target="$(get_path_arg)"
+  local before; before="$(get_identity)"
+  local identity; identity="$(new_identity)"
+  if [[ -n "$target" ]]; then
+    info "target: $target"
+    update_project_ids "$target" >/dev/null || true
+  elif config_get rotateDb "$cfg" | grep -qi true || get_db_flag; then
+    update_project_ids "" >/dev/null || true
+  else
+    info "database rows untouched, use -Db or a path to rotate them"
+  fi
+  if [[ -n "$before" ]]; then
+    local before_id; before_id="$(config_get projectId "$before")"
+    info "was $before_id"
+  fi
+  save_config "$cfg" >/dev/null
+  ok "identity rotated"
+}
+
+cmd_reset() {
+  step "full reset"
+  local cfg; cfg="$(get_config)"
+  local target; target="$(get_path_arg)"
+  local ip_before; ip_before="$(get_egress_ip "$(config_get proxy "$cfg")")"
+  info "egress ip before: $ip_before"
+  step "[1/4] rotating project identity"
+  local identity; identity="$(new_identity)"
+  if [[ -n "$target" ]]; then
+    info "target: $target"
+    update_project_ids "$target" >/dev/null || true
+  elif config_get rotateDb "$cfg" | grep -qi true || get_db_flag; then
+    update_project_ids "" >/dev/null || true
+  else
+    info "database rows untouched, sessions stay on the old id"
+  fi
+  remove_stuck_errors
+  step "[2/4] proxy path"
+  local proxy; proxy="$(config_get proxy "$cfg")"
+  if [[ -n "$proxy" ]]; then apply_proxy "$cfg"; restart_service; else info "manual mode, no proxy configured"; fi
+  step "[3/4] egress ip after"
+  sleep 1
+  local ip_after; ip_after="$(get_egress_ip "$proxy")"
+  cfg="$(config_set lastIp "$ip_after" "$cfg")"; save_config "$cfg" >/dev/null
+  if [[ "$ip_after" == "$ip_before" ]]; then warn "ip unchanged: $ip_after"; else ok "new egress ip: $ip_after"; fi
+  step "[4/4] direct api probe"
+  local probe; probe="$(invoke_quota_probe "$cfg")"
+  local state; state="$(config_get State "$probe")"
+  cfg="$(config_set lastBucket "$state" "$cfg")"; save_config "$cfg" >/dev/null
+  if [[ "$state" == "fresh" ]]; then ok "$(get_bucket_label "$state")"; else warn "$(get_bucket_label "$state")"; fi
+  info "a prompt that works is the real signal, or: opencode-unlimited test -live"
+  printf '\n'
+  ok "reset complete"
+  local id_proj; id_proj="$(config_get projectId "$identity")"
+  info "project id: $id_proj"
+}
+
+get_opencode_exe() {
+  local cmd
+  cmd="$(command -v opencode 2>/dev/null)" || true
+  local candidates=()
+  [[ -n "$cmd" ]] && candidates+=("$cmd" "${cmd%.*}.exe")
+  candidates+=("$HOME/.npm-global/lib/node_modules/@opencode/cli/bin/opencode")
+  local p
+  for p in "${candidates[@]}"; do
+    [[ -n "$p" && "$p" == *.exe && -x "$p" ]] && { printf '%s' "$p"; return; }
+  done
+  [[ -n "$cmd" ]] && printf '%s' "$cmd" || printf 'opencode'
+}
+
+cmd_test() {
+  local cfg; cfg="$(get_config)"
+  local live=false
+  local item
+  for item in "${rest[@]}"; do [[ "$item" == "-live" || "$item" == "--live" ]] && live=true; done
+  if $live; then
+    local oc model; oc="$(get_opencode_exe)"; model="$(config_get model "$cfg")"
+    [[ "$model" != */* ]] && model="opencode/$model"
+    step "live check through the app (uses one message)"
+    local out code
+    out="$("$oc" run -m "$model" "reply with: ok" 2>&1)" || true
+    code=$?
+    if [[ "$out" == *"Free usage limit reached"* || "$out" == *"used today's free messages"* ]]; then bad "EMPTY - the app itself is blocked on this connection"; return; fi
+    if [[ $code -eq 0 && "$out" == *\ ok\ * ]]; then ok "WORKING - the app answered, keep prompting"; return; fi
+    warn "could not confirm, output:"
+    info "$(printf '%s' "$out" | grep -v '^$' | head -4 | tr '\n' ' ')"
+    return
+  fi
+  step "direct api probe (free, but not the app quota)"
+  local proxy; proxy="$(config_get proxy "$cfg")"
+  local ip; ip="$(get_egress_ip "$proxy")"
+  info "egress ip: $ip"
+  local probe; probe="$(invoke_quota_probe "$cfg")"
+  local state; state="$(config_get State "$probe")"
+  cfg="$(config_set lastBucket "$state" "$cfg")"; cfg="$(config_set lastIp "$ip" "$cfg")"; save_config "$cfg" >/dev/null
+  if [[ "$state" == "fresh" ]]; then ok "$(get_bucket_label "$state")"; else warn "$(get_bucket_label "$state")"; fi
+  info "the app has its own quota; a prompt that works means you are fine"
+  info "real answer: opencode-unlimited test -live"
+}
+
+cmd_status() {
+  local cfg; cfg="$(get_config)"
+  step "opencode-unlimited status"
+  printf '\n'
+  step "identity"
+  local id; id="$(get_identity)"
+  if [[ -n "$id" ]]; then
+    local pid dir created
+    pid="$(config_get projectId "$id")"
+    dir="$(config_get directory "$id")"
+    created="$(config_get createdAt "$id")"
+    info "project id : $pid"
+    info "directory  : $dir"
+    info "updated    : $created"
+  else
+    warn "no identity yet, run: opencode-unlimited id"
+  fi
+  printf '\n'
+  step "plugin"
+  info "state      : $(get_plugin_state)"
+  info "path       : $plugin_file"
+  printf '\n'
+  step "network"
+  local proxy; proxy="$(config_get proxy "$cfg")"
+  local ip; ip="$(get_egress_ip "$proxy")"
+  info "egress ip  : $ip"
+  info "ipMode     : $(config_get ipMode "$cfg")"
+  info "upstream   : $([[ -n "$proxy" ]] && printf '%s' "$proxy" || printf 'none (manual)')"
+  local bridge_pid; bridge_pid="$(get_bridge_pid)"
+  if [[ "$bridge_pid" -gt 0 ]] && kill -0 "$bridge_pid" 2>/dev/null; then
+    info "bridge     : running (pid $bridge_pid, port $(config_get bridgePort "$cfg"))"
+  else
+    info "bridge     : stopped"
+  fi
+  local warp; warp="$(get_warp_cli)"
+  info "warp-cli   : $([[ -n "$warp" ]] && printf '%s' "$warp" || printf 'not installed (optional)')"
+  printf '\n'
+  step "direct api"
+  local probe; probe="$(invoke_quota_probe "$cfg")"
+  local state; state="$(config_get State "$probe")"
+  cfg="$(config_set lastBucket "$state" "$cfg")"
+  ip="$(get_egress_ip "$proxy")"
+  cfg="$(config_set lastIp "$ip" "$cfg")"; save_config "$cfg" >/dev/null
+  if [[ "$state" == "fresh" ]]; then ok "$(get_bucket_label "$state")"; else warn "$(get_bucket_label "$state")"; fi
+  info "app quota   : not measured here, see: opencode-unlimited test -live"
+}
+
+cmd_on() {
+  install_plugin
+  set_plugin_enabled true
+  ok "identity plugin enabled"
+}
+
+cmd_off() {
+  set_plugin_enabled false
+  ok "identity plugin disabled"
+}
+
+cmd_proxy() {
+  local cfg; cfg="$(get_config)"
+  local sub="${1:-status}"
+  case "$sub" in
+    off)
+      stop_bridge
+      cfg="$(config_set proxy "" "$cfg")"; cfg="$(config_set ipMode manual "$cfg")"; save_config "$cfg" >/dev/null
+      apply_proxy "$cfg"; restart_service
+      info "egress is direct again"
+      ;;
+    status)
+      local proxy; proxy="$(config_get proxy "$cfg")"
+      info "upstream : $([[ -n "$proxy" ]] && printf '%s' "$proxy" || printf 'none (manual)')"
+      info "bridge   : 127.0.0.1:$(config_get bridgePort "$cfg")"
+      info "ip       : $(get_egress_ip "$proxy")"
+      ;;
+    *)
+      local url
+      if [[ "$sub" == "set" && $# -ge 2 ]]; then url="$2"; else url="$1"; fi
+      if [[ ! "$url" =~ ^(socks5h?|http|https):// ]]; then bad "expected socks5://host:port or http://host:port"; return 1; fi
+      cfg="$(config_set proxy "$url" "$cfg")"; cfg="$(config_set ipMode proxy "$cfg")"
+      if ! apply_proxy "$cfg"; then
+        cfg="$(config_set proxy "" "$cfg")"; cfg="$(config_set ipMode manual "$cfg")"; save_config "$cfg" >/dev/null
+        info "state left on manual, nothing was restarted"; return 1
+      fi
+      save_config "$cfg" >/dev/null
+      restart_service
+      sleep 1
+      info "egress ip via proxy: $(get_egress_ip "$(config_get proxy "$cfg")")"
+      ;;
+  esac
+}
+
+cmd_warp() {
+  local warp; warp="$(get_warp_cli)"
+  [[ -n "$warp" ]] || { bad "warp-cli not found, install Cloudflare WARP or use: proxy set socks5://host:port"; return 1; }
+  local cfg; cfg="$(get_config)"
+  local sub="${1:-status}"
+  case "$sub" in
+    on)
+      "$warp" mode proxy >/dev/null 2>&1 || true
+      "$warp" proxy port 40000 >/dev/null 2>&1 || true
+      "$warp" connect >/dev/null 2>&1 || true
+      cfg="$(config_set proxy socks5://127.0.0.1:40000 "$cfg")"; cfg="$(config_set ipMode warp "$cfg")"; save_config "$cfg" >/dev/null
+      apply_proxy "$cfg"; restart_service
+      ok "warp proxy mode on, opencode routed through the bridge"
+      ;;
+    off)
+      "$warp" disconnect >/dev/null 2>&1 || true
+      stop_bridge
+      cfg="$(config_set proxy "" "$cfg")"; cfg="$(config_set ipMode manual "$cfg")"; save_config "$cfg" >/dev/null
+      apply_proxy "$cfg"; restart_service
+      ok "warp off, direct egress"
+      ;;
+    rotate)
+      info "reconnecting warp, this can change the egress ip"
+      local before after
+      before="$(get_egress_ip "$(config_get proxy "$cfg")")"
+      "$warp" disconnect >/dev/null 2>&1 || true
+      sleep 2
+      "$warp" connect >/dev/null 2>&1 || true
+      sleep 4
+      after="$(get_egress_ip "$(config_get proxy "$cfg")")"
+      if [[ "$after" == "$before" ]]; then
+        warn "ip unchanged: $after"
+        info "warp does not guarantee a new ip, reconnect again or use a proxy"
+      else ok "new egress ip: $before -> $after"; fi
+      ;;
+    *)
+      "$warp" status 2>&1 | while IFS= read -r line; do info "$line"; done
+      ;;
+  esac
+}
+
+cmd_run() {
+  [[ ${#rest[@]} -eq 0 ]] && { bad "usage: opencode-unlimited run <opencode args>"; return 1; }
+  local oc; oc="$(resolve_opencode)"
+  local attempt=1
+  while [[ $attempt -le 3 ]]; do
+    local out code
+    out="$("$oc" "${rest[@]}" 2>&1)" || true
+    code=$?
+    if [[ "$out" == *"Free usage limit reached"* || "$out" == *"used today's free messages"* ]]; then
+      warn "free limit hit (attempt $attempt/3)"
+      cmd_id >/dev/null || true
+      local cfg; cfg="$(get_config)"
+      local proxy; proxy="$(config_get proxy "$cfg")"
+      [[ -n "$proxy" ]] && { apply_proxy "$cfg"; restart_service; }
+      sleep 2
+      attempt=$((attempt+1))
+      continue
+    fi
+    printf '%s\n' "$out"
+    return $code
+  done
+  bad "still limited after 3 attempts"
+  info "new id does not refill the quota, change the connection and run: opencode-unlimited test -live"
+  return 1
+}
+
+cmd_doctor() {
+  step "opencode-unlimited doctor"
+  printf '\n'
+  info "shell    : bash ${BASH_VERSION%% *}"
+  local node_version=""
+  if command -v node >/dev/null 2>&1; then
+    node_version="$(node --version 2>/dev/null)"; ok "node       : $node_version"
+    if test_node_sqlite; then ok "sqlite     : node:sqlite available"; else warn "sqlite     : needs node 22.5+ for -Db features"; fi
+  else warn "node       : not found (proxy bridge and -Db need it)"; fi
+  if command -v curl >/dev/null 2>&1; then ok "curl       : found"; else warn "curl       : missing, using .NET fallback"; fi
+  local oc exe info version
+  oc="$(resolve_opencode)"; info "opencode   : $oc"
+  exe="$(get_opencode_exe)"
+  info="$("$exe" api get /api/info 2>/dev/null | tr -d '\r')" || true
+  version="$(printf '%s' "$info" | grep -o '"version":"[^"]*"' | head -1 || true)"
+  if [[ -n "$version" ]]; then ok "service    : running, $version"; else warn "service    : not reachable, start opencode once"; fi
+  local loaded
+  loaded="$("$exe" api get /api/plugin 2>/dev/null | tr -d '\r')" || true
+  if [[ "$loaded" == *"\"id\":\"unlimited-shield\""* ]]; then
+    if [[ "$loaded" == *"\"id\":\"unlimited-shield\".*\"status\":\"active\""* ]]; then ok "plugin     : loaded and active"; else warn "plugin     : loaded but not active"; fi
+  else
+    warn "plugin     : not loaded, run: opencode-unlimited install"
+  fi
+  local id; id="$(get_identity)"
+  local pid=""
+  if [[ -n "$id" ]]; then pid="$(config_get projectId "$id")"; fi
+  if [[ -n "$pid" && "$pid" =~ ^[0-9a-f]{40}$ ]]; then ok "identity   : $pid"; else warn "identity   : missing or invalid, run: opencode-unlimited id"; fi
+  local proxy; proxy="$(config_get "$(get_config)" proxy)"
+  info "upstream   : $([[ -n "$proxy" ]] && printf '%s' "$proxy" || printf 'none (manual)')"
+  info "egress ip  : $(get_egress_ip "$proxy")"
+}
+
+cmd_uninstall() {
+  step "uninstalling opencode-unlimited"
+  stop_bridge
+  set_plugin_enabled false
+  rm -f "$plugin_file" "$plugin_file.disabled" 2>/dev/null || true
+  ok "plugin removed"
+  local cfg_path
+  if [[ -f "$config_dir/opencode.jsonc" ]]; then cfg_path="$config_dir/opencode.jsonc"; elif [[ -f "$config_dir/opencode.json" ]]; then cfg_path="$config_dir/opencode.json"; else cfg_path=""; fi
+  if [[ -n "$cfg_path" && -f "$cfg_path" ]]; then
+    node - "$cfg_path" <<'NODE'
+const fs=require("fs");
+const cfgPath=process.argv[2];
+let cfg={};
+try { cfg=JSON.parse(fs.readFileSync(cfgPath,"utf8").replace(/^\uFEFF/,"")); } catch { process.exit(0); }
+const cmds=cfg.commands||{};
+for (const k of Object.keys(cmds)) {
+  if (k.startsWith("opencode-unlimited")) delete cmds[k];
+}
+fs.writeFileSync(cfgPath,JSON.stringify(cfg,null,2));
+process.stdout.write("slash commands removed\n");
+NODE
+  fi
+  set_service_env HTTPS_PROXY ""; set_service_env HTTP_PROXY ""; set_service_env ALL_PROXY ""
+  ok "service proxy cleared"
+  rm -f "$state_file" "$pid_file" "$log_file" 2>/dev/null || true
+  ok "state files removed"
+  info "repo and PATH entry kept, delete manually if you want: $root"
+}
+
+cmd_help() {
+  step "opencode-unlimited <command>"
+  printf '\n'
+  info "install              deploy plugin, register PATH, write state"
+  info "reset [path] [-Db]   rotate a project, clear stuck errors, verify"
+  info "id [path] [-Db]      rotate the header id, or one project by folder"
+  info "test [-live]         direct probe (free) or a real app check (costs 1 message)"
+  info "status               identity, plugin, network, bucket"
+  info "on | off             enable or disable the identity plugin"
+  info "proxy set <url>      route opencode through socks5:// or http://"
+  info "proxy off            drop the upstream, direct egress"
+  info "proxy status         show the current upstream"
+  info "warp on|off|rotate   Cloudflare WARP path (optional)"
+  info "run <args...>        run opencode, rotate on free-limit"
+  info "doctor               check node, service, plugin, identity"
+  info "uninstall            remove plugin, slash commands, state"
+}
+
+case "${command,,}" in
+  install) cmd_install ;;
+  reset) cmd_reset ;;
+  id) cmd_id ;;
+  test) cmd_test ;;
+  status) cmd_status ;;
+  on) cmd_on ;;
+  off) cmd_off ;;
+  proxy) cmd_proxy "${rest[@]}" ;;
+  run) cmd_run ;;
+  doctor) cmd_doctor ;;
+  uninstall) cmd_uninstall ;;
+  *) cmd_help ;;
+esac
