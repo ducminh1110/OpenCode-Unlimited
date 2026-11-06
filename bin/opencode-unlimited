@@ -9,6 +9,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$script_dir/.." && pwd)"
 bridge_js="$root/lib/proxy-bridge.js"
 bundled_plugin="$root/plugins/unlimited-shield.js"
+entry="$script_dir/$(basename "$0")"
 
 if [[ -z "${XDG_CONFIG_HOME:-}" ]]; then config_dir="$HOME/.config/opencode"; else config_dir="$XDG_CONFIG_HOME/opencode"; fi
 if [[ -z "${XDG_DATA_HOME:-}" ]]; then data_dir="$HOME/.local/share/opencode"; else data_dir="$XDG_DATA_HOME/opencode"; fi
@@ -847,29 +848,48 @@ cmd_warp() {
 }
 
 cmd_run() {
-  [[ ${#rest[@]} -eq 0 ]] && { bad "usage: opencode-unlimited run <opencode args>"; return 1; }
+  local bg=false
+  local args=()
+  local a
+  for a in "${rest[@]}"; do
+    if [[ "$a" == "--bg" || "$a" == "-b" ]]; then bg=true; else args+=("$a"); fi
+  done
+  [[ ${#args[@]} -eq 0 ]] && { bad "usage: opencode-unlimited run|code [--bg] <opencode args>"; return 1; }
   local oc; oc="$(resolve_opencode)"
-  local attempt=1
-  while [[ $attempt -le 3 ]]; do
+  local log_file="$config_dir/unlimited-run.log"
+  local pid_file="$config_dir/unlimited-run.pid"
+  mkdir -p "$config_dir"
+
+  # Chạy nền (bền với ngắt SSH / Ctrl+C): tách phiên mới, bỏ qua SIGHUP, ghi log.
+  if $bg; then
+    nohup setsid "$entry" run "${args[@]}" >>"$log_file" 2>&1 &
+    local bgpid=$!
+    printf '%s' "$bgpid" > "$pid_file"
+    disown "$bgpid" 2>/dev/null || true
+    ok "chạy nền (pid $bgpid), log: $log_file"
+    info "theo dõi: tail -f $log_file"
+    return 0
+  fi
+
+  # Vòng lặp tự reset khi hết limit, chạy cho đến khi thành công.
+  local attempt=0
+  while true; do
+    attempt=$((attempt + 1))
     local out code
-    out="$("$oc" "${rest[@]}" 2>&1)" || true
+    out="$("$oc" "${args[@]}" 2>&1)" || true
     code=$?
     if [[ "$out" == *"Free usage limit reached"* || "$out" == *"used today's free messages"* ]]; then
-      warn "free limit hit (attempt $attempt/3)"
+      warn "hết limit (lần thử $attempt), tự động reset..."
       cmd_id >/dev/null || true
       local cfg; cfg="$(get_config)"
       local proxy; proxy="$(config_get proxy "$cfg")"
       [[ -n "$proxy" ]] && { apply_proxy "$cfg"; restart_service; }
       sleep 2
-      attempt=$((attempt+1))
       continue
     fi
     printf '%s\n' "$out"
     return $code
   done
-  bad "still limited after 3 attempts"
-  info "new id does not refill the quota, change the connection and run: opencode-unlimited test -live"
-  return 1
 }
 
 cmd_doctor() {
@@ -946,7 +966,7 @@ cmd_help() {
   info "proxy off            drop the upstream, direct egress"
   info "proxy status         show the current upstream"
   info "warp on|off|rotate   Cloudflare WARP path (optional)"
-  info "run <args...>        run opencode, rotate on free-limit"
+  info "run|code [--bg] <args...>  chạy opencode, tự reset khi hết limit (--bg: chạy nền bền với ngắt SSH)"
   info "doctor               check node, service, plugin, identity"
   info "uninstall            remove plugin, slash commands, state"
 }
@@ -961,6 +981,7 @@ case "${command,,}" in
   off) cmd_off ;;
   proxy) cmd_proxy "${rest[@]}" ;;
   run) cmd_run ;;
+  code) cmd_run ;;
   doctor) cmd_doctor ;;
   uninstall) cmd_uninstall ;;
   *) cmd_help ;;
