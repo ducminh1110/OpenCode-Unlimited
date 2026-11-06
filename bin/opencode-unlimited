@@ -856,12 +856,24 @@ cmd_run() {
   done
   [[ ${#args[@]} -eq 0 ]] && { bad "usage: opencode-unlimited run|code [--bg] <opencode args>"; return 1; }
   local oc; oc="$(resolve_opencode)"
-  local log_file="$config_dir/unlimited-run.log"
-  local pid_file="$config_dir/unlimited-run.pid"
+  local sess="opencode-unlimited"
   mkdir -p "$config_dir"
 
-  # Chạy nền (bền với ngắt SSH / Ctrl+C): tách phiên mới, bỏ qua SIGHUP, ghi log.
+  # Chạy nền trong tmux: bền với ngắt SSH, sau này gắn lại bằng 'opencode-unlimited resume'.
   if $bg; then
+    if command -v tmux >/dev/null 2>&1; then
+      if tmux has-session -t "$sess" 2>/dev/null; then
+        ok "phiên tmux '$sess' đã đang chạy"
+      else
+        tmux new-session -d -s "$sess" "$entry" run "${args[@]}"
+        ok "khởi chạy nền trong tmux phiên '$sess'"
+      fi
+      info "resume: opencode-unlimited resume      (hoặc: tmux attach -t $sess)"
+      return 0
+    fi
+    # Fallback nếu không có tmux: chạy bằng nohup/setsid, ghi log.
+    local log_file="$config_dir/unlimited-run.log"
+    local pid_file="$config_dir/unlimited-run.pid"
     nohup setsid "$entry" run "${args[@]}" >>"$log_file" 2>&1 &
     local bgpid=$!
     printf '%s' "$bgpid" > "$pid_file"
@@ -890,6 +902,31 @@ cmd_run() {
     printf '%s\n' "$out"
     return $code
   done
+}
+
+cmd_resume() {
+  if ! command -v tmux >/dev/null 2>&1; then
+    bad "tmux không được cài đặt, không thể resume"; return 1
+  fi
+  local name="${1:-}"
+  local sessions
+  sessions="$(tmux list-sessions 2>/dev/null | grep '^opencode-unlimited' || true)"
+  if [[ -z "$sessions" ]]; then
+    bad "không tìm thấy phiên opencode-unlimited nào đang chạy"; return 1
+  fi
+  if [[ -n "$name" ]]; then
+    ok "đang nối lại phiên '$name' ..."
+    exec tmux attach -t "$name"
+  fi
+  local count; count="$(printf '%s\n' "$sessions" | grep -c .)"
+  if [[ $count -eq 1 ]]; then
+    local sname; sname="$(printf '%s\n' "$sessions" | head -1 | cut -d: -f1)"
+    ok "đang nối lại phiên '$sname' ..."
+    exec tmux attach -t "$sname"
+  fi
+  info "các phiên opencode-unlimited đang chạy:"
+  printf '%s\n' "$sessions"
+  info "dùng: opencode-unlimited resume <tên_phien>   (hoặc: tmux attach -t <tên_phien>)"
 }
 
 cmd_doctor() {
@@ -966,7 +1003,8 @@ cmd_help() {
   info "proxy off            drop the upstream, direct egress"
   info "proxy status         show the current upstream"
   info "warp on|off|rotate   Cloudflare WARP path (optional)"
-  info "run|code [--bg] <args...>  chạy opencode, tự reset khi hết limit (--bg: chạy nền bền với ngắt SSH)"
+  info "run|code [--bg] <args...>  chạy opencode, tự reset khi hết limit (--bg: chạy nền tmux bền với ngắt SSH)"
+  info "resume [tên_phien]          gắn lại phiên tmux opencode-unlimited (xem agent vẫn đang chạy)"
   info "doctor               check node, service, plugin, identity"
   info "uninstall            remove plugin, slash commands, state"
 }
@@ -982,6 +1020,7 @@ case "${command,,}" in
   proxy) cmd_proxy "${rest[@]}" ;;
   run) cmd_run ;;
   code) cmd_run ;;
+  resume) cmd_resume "${rest[@]}" ;;
   doctor) cmd_doctor ;;
   uninstall) cmd_uninstall ;;
   *) cmd_help ;;

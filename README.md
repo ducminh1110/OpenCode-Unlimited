@@ -89,7 +89,8 @@ That's the whole workflow. Everything else is optional.
 | `opencode-unlimited proxy set socks5://host:port` | Route OpenCode through a proxy |
 | `opencode-unlimited proxy off` | Back to a direct connection |
 | `opencode-unlimited run|code <args>` | Chạy opencode, tự động reset khi hết limit |
-| `opencode-unlimited run|code --bg <args>` | Chạy nền, bền với ngắt SSH, tự reset và tiếp tục |
+| `opencode-unlimited run|code --bg <args>` | Chạy nền trong tmux, bền với ngắt SSH, tự reset và tiếp tục |
+| `opencode-unlimited resume [tên]` | Gắn lại phiên tmux opencode-unlimited (xem agent vẫn đang chạy) |
 | `opencode-unlimited doctor` | Check node, service, plugin, identity |
 | `opencode-unlimited uninstall` | Remove plugin, menu commands, state |
 
