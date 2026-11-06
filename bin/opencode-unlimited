@@ -854,18 +854,49 @@ cmd_run() {
   for a in "${rest[@]}"; do
     if [[ "$a" == "--bg" || "$a" == "-b" ]]; then bg=true; else args+=("$a"); fi
   done
-  [[ ${#args[@]} -eq 0 ]] && { bad "usage: opencode-unlimited run|code [--bg] <opencode args>"; return 1; }
   local oc; oc="$(resolve_opencode)"
   local sess="opencode-unlimited"
   mkdir -p "$config_dir"
 
+  # Tạo script chạy nền có vòng lặp tự reset khi hết limit.
+  mk_bg_wrapper() {
+    local wrapper="$1"
+    {
+      printf '#!/usr/bin/env bash\nset -uo pipefail\n'
+      printf 'oc="%s"\n' "$oc"
+      printf 'entry="%s"\n' "$entry"
+      printf 'args=('
+      local x
+      for x in "${args[@]}"; do printf ' %q' "$x"; done
+      printf ' )\n'
+      cat <<'EOF'
+while true; do
+  out="$("$oc" "${args[@]}" 2>&1)" || true
+  code=$?
+  if [[ "$out" == *"Free usage limit reached"* || "$out" == *"used today's free messages"* ]]; then
+    echo "hết limit, tự động reset project id..."
+    "$entry" id >/dev/null 2>&1 || true
+    sleep 2
+    continue
+  fi
+  printf '%s\n' "$out"
+  exit $code
+done
+EOF
+    } > "$wrapper"
+    chmod +x "$wrapper"
+  }
+
   # Chạy nền trong tmux: bền với ngắt SSH, sau này gắn lại bằng 'opencode-unlimited resume'.
   if $bg; then
+    local wrapper="$config_dir/.unlimited-bg.sh"
+    mk_bg_wrapper "$wrapper"
     if command -v tmux >/dev/null 2>&1; then
       if tmux has-session -t "$sess" 2>/dev/null; then
         ok "phiên tmux '$sess' đã đang chạy"
       else
-        tmux new-session -d -s "$sess" "$entry" run "${args[@]}"
+        tmux new-session -d -s "$sess" "$wrapper"
+        tmux set-option -t "$sess" remain-on-exit on 2>/dev/null || true
         ok "khởi chạy nền trong tmux phiên '$sess'"
       fi
       info "resume: opencode-unlimited resume      (hoặc: tmux attach -t $sess)"
@@ -874,7 +905,7 @@ cmd_run() {
     # Fallback nếu không có tmux: chạy bằng nohup/setsid, ghi log.
     local log_file="$config_dir/unlimited-run.log"
     local pid_file="$config_dir/unlimited-run.pid"
-    nohup setsid "$entry" run "${args[@]}" >>"$log_file" 2>&1 &
+    nohup setsid "$wrapper" >>"$log_file" 2>&1 &
     local bgpid=$!
     printf '%s' "$bgpid" > "$pid_file"
     disown "$bgpid" 2>/dev/null || true
@@ -883,7 +914,11 @@ cmd_run() {
     return 0
   fi
 
-  # Vòng lặp tự reset khi hết limit, chạy cho đến khi thành công.
+  # Chạy trước mặt: vòng lặp tự reset khi hết limit (chạy 1 lần nếu không có args).
+  if [[ ${#args[@]} -eq 0 ]]; then
+    "$oc"
+    return $?
+  fi
   local attempt=0
   while true; do
     attempt=$((attempt + 1))
